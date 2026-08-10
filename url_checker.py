@@ -3,6 +3,8 @@ import sys
 import re
 import subprocess
 import threading
+import json
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import tkinter as tk
@@ -17,7 +19,6 @@ def detect_soft_error(body: str) -> int:
         
     clean_text = " ".join(body.split()).lower()
     
-    # Check title tag first
     title_match = re.search(r"<title[^>]*>(.*?)</title>", clean_text, re.IGNORECASE)
     title_text = title_match.group(1) if title_match else ""
     
@@ -38,11 +39,31 @@ def detect_soft_error(body: str) -> int:
     return 0
 
 
+def lookup_hosting_provider(ip: str, server_header: str) -> str:
+    """Resolves IP address to ISP / Hosting Provider using IP API with Server header fallback."""
+    if not ip or ip in ["0.0.0.0", "127.0.0.1", ""]:
+        return server_header if server_header else "Unknown"
+
+    try:
+        # Free API endpoint for IP to ISP / Org resolution
+        url = f"http://ip-api.com/json/{ip}?fields=status,isp,org,as,hosting"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode())
+            if data.get("status") == "success":
+                provider = data.get("org") or data.get("isp") or data.get("as")
+                return provider
+    except Exception:
+        pass
+
+    return server_header if server_header else "Unknown"
+
+
 class URLCheckerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("URL Status & Redirect Checker")
-        self.root.geometry("800x580")
+        self.root.geometry("850x600")
         self.root.resizable(True, True)
 
         self.input_file_path = ""
@@ -123,16 +144,15 @@ class URLCheckerApp:
         self.btn_start.config(state=tk.DISABLED)
         self.btn_select.config(state=tk.DISABLED)
         
-        # Run in separate thread to prevent Tkinter UI freezing
         threading.Thread(target=self.run_checker, daemon=True).start()
 
     def run_curl_check(self, url: str, timeout: int = 10) -> dict:
         target_url = url if url.startswith(("http://", "https://")) else f"http://{url}"
         
-        # -i includes HTTP headers to capture intermediate 301/302 redirects
+        # Include %{primary_ip} in -w format string to extract host IP
         cmd = [
             "curl", "-s", "-i", "-L",
-            "-w", f"\n{DELIMITER}\n%{{http_code}}|%{{time_total}}|%{{size_download}}|%{{num_redirects}}|%{{url_effective}}|%{{redirect_url}}",
+            "-w", f"\n{DELIMITER}\n%{{http_code}}|%{{time_total}}|%{{size_download}}|%{{num_redirects}}|%{{url_effective}}|%{{redirect_url}}|%{{primary_ip}}",
             "--max-time", str(timeout),
             target_url
         ]
@@ -151,8 +171,16 @@ class URLCheckerApp:
                 num_redirects = int(meta_parts[3]) if len(meta_parts) > 3 and meta_parts[3].isdigit() else 0
                 effective_url = meta_parts[4] if len(meta_parts) > 4 else ""
                 redirect_url = meta_parts[5] if len(meta_parts) > 5 else ""
+                primary_ip = meta_parts[6] if len(meta_parts) > 6 else ""
+
+                # Extract Server Header from response
+                server_match = re.search(r"^Server:\s*(.*)$", raw_content, re.MULTILINE | re.IGNORECASE)
+                server_header = server_match.group(1).strip() if server_match else "N/A"
+
+                # Identify Hosting / Service Provider
+                hosting_provider = lookup_hosting_provider(primary_ip, server_header)
                 
-                # Parse all status codes in the redirect chain (301 -> 302 -> 200)
+                # Parse redirect chain status codes
                 status_matches = re.findall(r"^HTTP/[\d\.]+\s+(\d{3})", raw_content, re.MULTILINE | re.IGNORECASE)
                 status_codes = [int(c) for c in status_matches]
                 
@@ -163,7 +191,6 @@ class URLCheckerApp:
                 final_status = status_codes[-1]
                 redirect_chain = " -> ".join(map(str, status_codes)) if len(status_codes) > 1 else str(initial_status)
                 
-                # Extract HTML body content after header block
                 header_matches = list(re.finditer(r"^HTTP/[\d\.]+\s+\d{3}.*?(?=\r?\n\r?\n)", raw_content, re.DOTALL | re.MULTILINE | re.IGNORECASE))
                 if header_matches:
                     body = raw_content[header_matches[-1].end():].strip()
@@ -172,7 +199,7 @@ class URLCheckerApp:
                 
                 redirect_target = effective_url if num_redirects > 0 else (redirect_url if redirect_url else "")
                 
-                # Soft Error Page Detection
+                # Soft Error Detection
                 soft_code = detect_soft_error(body) if final_status == 200 else 0
                 
                 if final_status >= 400:
@@ -210,6 +237,9 @@ class URLCheckerApp:
                     "Redirect Chain": redirect_chain,
                     "Redirect Target": redirect_target,
                     "Redirect Count": num_redirects,
+                    "IP Address": primary_ip,
+                    "Server Header": server_header,
+                    "Hosting Provider": hosting_provider,
                     "Response Time (s)": round(resp_time, 3),
                     "Size (Bytes)": size_bytes,
                     "Response Type": resp_type,
@@ -220,14 +250,15 @@ class URLCheckerApp:
                 return {
                     "URL": url, "Initial Status": 0, "Final Status": 0, "Detected Status": "Failed / No Response",
                     "Redirect Chain": "None", "Redirect Target": "", "Redirect Count": 0,
+                    "IP Address": "", "Server Header": "N/A", "Hosting Provider": "Unknown",
                     "Response Time (s)": 0.0, "Size (Bytes)": 0, "Response Type": "Empty Response",
                     "Error": "Empty response", "Response Body": ""
                 }
                 
         except subprocess.TimeoutExpired:
-            return {"URL": url, "Initial Status": 0, "Final Status": 0, "Detected Status": "Timeout", "Redirect Chain": "None", "Redirect Target": "", "Redirect Count": 0, "Response Time (s)": timeout, "Size (Bytes)": 0, "Response Type": "Timeout", "Error": "Timeout", "Response Body": ""}
+            return {"URL": url, "Initial Status": 0, "Final Status": 0, "Detected Status": "Timeout", "Redirect Chain": "None", "Redirect Target": "", "Redirect Count": 0, "IP Address": "", "Server Header": "N/A", "Hosting Provider": "Unknown", "Response Time (s)": timeout, "Size (Bytes)": 0, "Response Type": "Timeout", "Error": "Timeout", "Response Body": ""}
         except Exception as e:
-            return {"URL": url, "Initial Status": 0, "Final Status": 0, "Detected Status": "Error", "Redirect Chain": "None", "Redirect Target": "", "Redirect Count": 0, "Response Time (s)": 0.0, "Size (Bytes)": 0, "Response Type": "Exception", "Error": str(e), "Response Body": ""}
+            return {"URL": url, "Initial Status": 0, "Final Status": 0, "Detected Status": "Error", "Redirect Chain": "None", "Redirect Target": "", "Redirect Count": 0, "IP Address": "", "Server Header": "N/A", "Hosting Provider": "Unknown", "Response Time (s)": 0.0, "Size (Bytes)": 0, "Response Type": "Exception", "Error": str(e), "Response Body": ""}
 
     def run_checker(self):
         try:
@@ -257,7 +288,7 @@ class URLCheckerApp:
                     res = future.result()
                     results.append(res)
                     
-                    log_msg = f"[{res['Redirect Chain']}] | {res['Response Time (s)']}s | {res['URL']}"
+                    log_msg = f"[{res['Redirect Chain']}] | {res['Response Time (s)']}s | {res['URL']} | Provider: {res['Hosting Provider']}"
                     if res["Redirect Target"]:
                         log_msg += f"\n   └─► Redirect Target ➔ {res['Redirect Target']}"
                     if "Soft" in res["Detected Status"] or res["Final Status"] >= 400:
@@ -269,6 +300,7 @@ class URLCheckerApp:
             columns_order = [
                 "URL", "Initial Status", "Final Status", "Detected Status", 
                 "Redirect Chain", "Redirect Target", "Redirect Count", 
+                "IP Address", "Server Header", "Hosting Provider",
                 "Response Time (s)", "Size (Bytes)", "Response Type", "Error", "Response Body"
             ]
             results_df = results_df[columns_order]
